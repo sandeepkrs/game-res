@@ -1,0 +1,606 @@
+#!/usr/bin/env python3
+import sys
+import os
+import json
+import math
+import subprocess
+import signal
+import atexit
+
+try:
+    from gi.repository import Gio, GLib
+except ImportError:
+    import dbus
+    Gio = None
+
+CONF_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "game-res.conf")
+
+# Base resolution tiers by vertical height
+TIER_HEIGHTS = {
+    'FHD': 1080,
+    '1080P': 1080,
+    '2K': 1440,
+    '2.5K': 1440,
+    'QHD': 1440,
+    '1440P': 1440,
+    '4K': 2160,
+    'UHD': 2160,
+    '2160P': 2160,
+}
+
+# Standard aspect-ratio mappings: (tier_height) -> (target_w, target_h)
+ASPECT_RATIO_TIERS = {
+    '16:9': {
+        1080: (1920, 1080),
+        1440: (2560, 1440),
+        2160: (3840, 2160),
+    },
+    '16:10': {
+        1080: (1920, 1200),
+        1440: (2560, 1600),
+        2160: (3840, 2400),
+    },
+    '21:9': {
+        1080: (2560, 1080),
+        1440: (3440, 1440),
+        2160: (5120, 2160),
+    },
+    '32:9': {
+        1080: (3840, 1080),
+        1440: (5120, 1440),
+        2160: (7680, 2160),
+    }
+}
+
+def get_display_interface():
+    if Gio is not None:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        proxy = Gio.DBusProxy.new_sync(
+            bus, Gio.DBusProxyFlags.NONE, None,
+            'org.gnome.Mutter.DisplayConfig',
+            '/org/gnome/Mutter/DisplayConfig',
+            'org.gnome.Mutter.DisplayConfig',
+            None
+        )
+        return "gio", proxy
+    else:
+        bus = dbus.SessionBus()
+        mutter = bus.get_object('org.gnome.Mutter.DisplayConfig', '/org/gnome/Mutter/DisplayConfig')
+        iface = dbus.Interface(mutter, 'org.gnome.Mutter.DisplayConfig')
+        return "dbus", iface
+
+def parse_scale(val_str):
+    clean_str = str(val_str).rstrip('%').strip()
+    val = float(clean_str)
+    if val >= 50.0:
+        return val / 100.0
+    return val
+
+def is_internal_connector(name):
+    upper = name.upper()
+    return upper.startswith(('EDP', 'LVDS', 'DSI'))
+
+def detect_aspect_ratio(w, h):
+    ratio = w / float(h)
+    if math.isclose(ratio, 16/9, abs_tol=0.04):
+        return '16:9', 16/9
+    elif math.isclose(ratio, 16/10, abs_tol=0.03):
+        return '16:10', 16/10
+    elif math.isclose(ratio, 21/9, abs_tol=0.08) or math.isclose(ratio, 64/27, abs_tol=0.08):
+        return '21:9', 21/9
+    elif math.isclose(ratio, 32/9, abs_tol=0.10):
+        return '32:9', 32/9
+    return f"{ratio:.2f}:1", ratio
+
+def get_current_config(backend, iface):
+    if backend == "gio":
+        res = iface.call_sync('GetCurrentState', None, Gio.DBusCallFlags.NONE, -1, None)
+        serial = res.get_child_value(0).get_uint32()
+        phys_var = res.get_child_value(1)
+        logic_var = res.get_child_value(2)
+        
+        monitors = []
+        for p_idx in range(phys_var.n_children()):
+            pm = phys_var.get_child_value(p_idx)
+            info = pm.get_child_value(0)
+            connector = info.get_child_value(0).get_string()
+            modes_var = pm.get_child_value(1)
+            modes = []
+            for m_idx in range(modes_var.n_children()):
+                m = modes_var.get_child_value(m_idx)
+                mode_id = m.get_child_value(0).get_string()
+                w = m.get_child_value(1).get_int32()
+                h = m.get_child_value(2).get_int32()
+                rate = m.get_child_value(3).get_double()
+                modes.append({'id': mode_id, 'w': w, 'h': h, 'rate': rate})
+            monitors.append({'connector': connector, 'modes': modes})
+            
+        logical = []
+        for l_idx in range(logic_var.n_children()):
+            lm = logic_var.get_child_value(l_idx)
+            x = lm.get_child_value(0).get_int32()
+            y = lm.get_child_value(1).get_int32()
+            scale = lm.get_child_value(2).get_double()
+            transform = lm.get_child_value(3).get_uint32()
+            primary = lm.get_child_value(4).get_boolean()
+            mon_list = lm.get_child_value(5)
+            connector = mon_list.get_child_value(0).get_child_value(0).get_string()
+            
+            current_mode_id = None
+            for p_idx in range(phys_var.n_children()):
+                pm = phys_var.get_child_value(p_idx)
+                if pm.get_child_value(0).get_child_value(0).get_string() == connector:
+                    modes_var = pm.get_child_value(1)
+                    for m_idx in range(modes_var.n_children()):
+                        m = modes_var.get_child_value(m_idx)
+                        props = m.get_child_value(6)
+                        for prop_idx in range(props.n_children()):
+                            entry = props.get_child_value(prop_idx)
+                            k = entry.get_child_value(0).get_string()
+                            if k == "is-current" and entry.get_child_value(1).get_variant().get_boolean():
+                                current_mode_id = m.get_child_value(0).get_string()
+                                break
+            logical.append({
+                'x': x, 'y': y, 'scale': scale,
+                'transform': transform, 'primary': primary,
+                'connector': connector, 'mode_id': current_mode_id
+            })
+        return serial, monitors, logical
+    else:
+        serial, phys, logic, props = iface.GetCurrentState()
+        monitors = []
+        for pm in phys:
+            connector = str(pm[0][0])
+            modes = [{'id': str(m[0]), 'w': int(m[1]), 'h': int(m[2]), 'rate': float(m[3])} for m in pm[1]]
+            monitors.append({'connector': connector, 'modes': modes})
+        logical = []
+        for lm in logic:
+            x, y, scale, transform, primary, mon_list, _ = lm
+            connector = str(mon_list[0][0])
+            current_mode_id = None
+            for pm in phys:
+                if str(pm[0][0]) == connector:
+                    for m in pm[1]:
+                        props_dict = m[6]
+                        if props_dict.get('is-current', False):
+                            current_mode_id = str(m[0])
+            logical.append({
+                'x': int(x), 'y': int(y), 'scale': float(scale),
+                'transform': int(transform), 'primary': bool(primary),
+                'connector': connector, 'mode_id': current_mode_id
+            })
+        return int(serial), monitors, logical
+
+def apply_config(backend, iface, serial, logical_monitors):
+    if backend == "gio":
+        lm_builder = GLib.VariantBuilder(GLib.VariantType('a(iiduba(ssa{sv}))'))
+        for lm in logical_monitors:
+            mon_builder = GLib.VariantBuilder(GLib.VariantType('a(ssa{sv})'))
+            mon_builder.add_value(GLib.Variant('(ssa{sv})', (lm['connector'], lm['mode_id'], {})))
+            
+            lm_tuple = GLib.Variant(
+                '(iiduba(ssa{sv}))',
+                (lm['x'], lm['y'], lm['scale'], lm['transform'], lm['primary'], mon_builder.end())
+            )
+            lm_builder.add_value(lm_tuple)
+            
+        params = GLib.Variant('(uua(iiduba(ssa{sv}))a{sv})', (serial, 1, lm_builder.end(), {}))
+        iface.call_sync('ApplyMonitorsConfig', params, Gio.DBusCallFlags.NONE, -1, None)
+    else:
+        import dbus
+        lm_list = []
+        for lm in logical_monitors:
+            mons = dbus.Array([
+                dbus.Struct([dbus.String(lm['connector']), dbus.String(lm['mode_id']), dbus.Dictionary({}, signature='sv')], signature='ssa{sv}')
+            ], signature='(ssa{sv})')
+            lm_list.append(
+                dbus.Struct([
+                    dbus.Int32(lm['x']), dbus.Int32(lm['y']), dbus.Double(lm['scale']),
+                    dbus.UInt32(lm['transform']), dbus.Boolean(lm['primary']),
+                    mons
+                ], signature='iiduba(ssa{sv})')
+            )
+        dbus_lms = dbus.Array(lm_list, signature='(iiduba(ssa{sv}))')
+        iface.ApplyMonitorsConfig(dbus.UInt32(serial), dbus.UInt32(1), dbus_lms, dbus.Dictionary({}, signature='sv'))
+
+def load_conf():
+    if not os.path.exists(CONF_FILE):
+        return None
+    try:
+        with open(CONF_FILE, 'r') as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or 'logical_monitors' not in data:
+            return None
+        for lm in data['logical_monitors']:
+            req_keys = ('connector', 'mode_id', 'scale', 'x', 'y', 'transform', 'primary')
+            if not all(k in lm for k in req_keys):
+                return None
+        return data
+    except Exception:
+        return None
+
+def save_conf(data):
+    try:
+        with open(CONF_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception as e:
+        print(f"[game-res] Warning: Failed to save {CONF_FILE}: {e}")
+        return False
+
+def resolve_target_connectors(target_spec, logical_monitors):
+    if not target_spec or target_spec.lower() == 'primary':
+        primary_lm = next((lm for lm in logical_monitors if lm['primary']), logical_monitors[0])
+        return [primary_lm['connector']]
+    
+    if target_spec.lower() == 'all':
+        return [lm['connector'] for lm in logical_monitors]
+        
+    if target_spec.lower() == 'external':
+        externals = [lm['connector'] for lm in logical_monitors if not is_internal_connector(lm['connector'])]
+        if len(externals) == 0:
+            print("[game-res] Error: No external monitor detected.")
+            sys.exit(1)
+        elif len(externals) == 1:
+            return externals
+        else:
+            print(f"[game-res] Error: Multiple external monitors detected ({', '.join(externals)}). Specify which one via -m <name/number>.")
+            sys.exit(1)
+            
+    # Try numeric index
+    if target_spec.isdigit():
+        idx = int(target_spec)
+        if 0 <= idx < len(logical_monitors):
+            return [logical_monitors[idx]['connector']]
+        elif 1 <= idx <= len(logical_monitors):
+            return [logical_monitors[idx - 1]['connector']]
+        else:
+            print(f"[game-res] Error: Monitor index {idx} out of range. Active monitors: 0 to {len(logical_monitors) - 1}")
+            sys.exit(1)
+            
+    # Match connector name
+    for lm in logical_monitors:
+        if lm['connector'].lower() == target_spec.lower():
+            return [lm['connector']]
+            
+    print(f"[game-res] Error: Monitor '{target_spec}' not found. Available: {[lm['connector'] for lm in logical_monitors]}")
+    sys.exit(1)
+
+def pick_best_mode(phys_modes, target_w, target_h, native_ratio):
+    # 1. Exact match
+    exact = [m for m in phys_modes if m['w'] == target_w and m['h'] == target_h]
+    if exact:
+        exact.sort(key=lambda m: m['rate'], reverse=True)
+        return exact[0]['id'], exact[0]['w'], exact[0]['h'], exact[0]['rate']
+
+    # 2. Aspect-ratio matching modes
+    aspect_matched = [m for m in phys_modes if math.isclose(m['w'] / float(m['h']), native_ratio, abs_tol=0.05)]
+    if aspect_matched:
+        aspect_matched.sort(key=lambda m: (abs(m['h'] - target_h), -m['rate']))
+        m = aspect_matched[0]
+        return m['id'], m['w'], m['h'], m['rate']
+
+    # 3. Fallback to closest resolution by total pixel count
+    sorted_modes = sorted(phys_modes, key=lambda m: (abs(m['w'] * m['h'] - target_w * target_h), -m['rate']))
+    m = sorted_modes[0]
+    return m['id'], m['w'], m['h'], m['rate']
+
+def print_status_report(conf_data, monitors, logical_monitors):
+    print("=" * 65)
+    print("                      GAME-RES STATUS")
+    print("=" * 65)
+    
+    # Conf file status
+    if conf_data:
+        last_target = conf_data.get('last_target_monitor', 'primary')
+        print(f"Configuration File : {CONF_FILE} (Valid)")
+        print(f"Last Applied Target: {last_target}")
+        print("Saved Baseline Configuration:")
+        for idx, lm in enumerate(conf_data.get('logical_monitors', [])):
+            prim_str = " [Primary]" if lm.get('primary') else ""
+            print(f"  • Monitor #{idx} ({lm['connector']}){prim_str}: {lm['mode_id']} @ scale {lm['scale']:.2f} (pos: {lm['x']},{lm['y']})")
+    else:
+        print(f"Configuration File : {CONF_FILE} (Not yet created or invalid)")
+        print("  (Will be initialized automatically on first resolution change)")
+    
+    print("-" * 65)
+    print("Detected Active Monitors:")
+    for idx, lm in enumerate(logical_monitors):
+        conn = lm['connector']
+        is_prim = lm['primary']
+        is_int = is_internal_connector(conn)
+        mon_type = "Internal" if is_int else "External"
+        if is_prim:
+            mon_type += ", Primary"
+            
+        phys = next((m for m in monitors if m['connector'] == conn), None)
+        native_mode = phys['modes'][0] if phys and phys['modes'] else None
+        aspect_name, _ = detect_aspect_ratio(native_mode['w'], native_mode['h']) if native_mode else ("Unknown", 1.0)
+        
+        print(f"  [{idx}] {conn} ({mon_type}):")
+        print(f"      Current Mode : {lm['mode_id']} (scale: {lm['scale']:.2f})")
+        if native_mode:
+            print(f"      Native Res   : {native_mode['w']}x{native_mode['h']} ({aspect_name})")
+            top_modes = [f"{m['w']}x{m['h']}@{m['rate']:.0f}Hz" for m in phys['modes'][:4]]
+            print(f"      Sample Modes : {', '.join(top_modes)}")
+    
+    print("-" * 65)
+    print("Usage Examples:")
+    print("  game-res -r FHD -- /path/to/game       # Switch primary to FHD and launch game")
+    print("  game-res -s 100% -- /path/to/game      # Switch only scaling (e.g. 100%) and launch game")
+    print("  game-res -s 125%                       # Set scaling to 125% (press Enter to revert)")
+    print("  game-res -m external -r 2K -- steam    # Switch external monitor to 2K")
+    print("  game-res -m all -r 1080p               # Switch all displays to 1080p")
+    print("  game-res -u                            # Update baseline conf with current settings")
+    print("  game-res --restore                     # Restore display(s) to saved baseline")
+    print("  game-res --restore -m external         # Restore only external display")
+    print("=" * 65)
+
+def parse_args():
+    target_preset = None
+    target_w = None
+    target_h = None
+    target_scale = None
+    target_monitor = None
+    update_conf = False
+    is_restore = False
+    command = []
+    
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == '--restore':
+            is_restore = True
+            i += 1
+        elif arg in ('-u', '--update-conf'):
+            update_conf = True
+            i += 1
+        elif arg in ('-m', '--monitor'):
+            if i + 1 < len(args):
+                target_monitor = args[i+1]
+                i += 2
+            else:
+                print("[game-res] Error: -m/--monitor requires an argument.")
+                sys.exit(1)
+        elif arg in ('-r', '-R', '--res', '--resolution'):
+            if i + 1 < len(args):
+                target_preset = args[i+1].upper().strip()
+                i += 2
+            else:
+                print("[game-res] Error: -r/--resolution requires an argument.")
+                sys.exit(1)
+        elif arg in ('-W', '-w', '--width'):
+            if i + 1 < len(args):
+                target_w = int(args[i+1])
+                i += 2
+            else:
+                print("[game-res] Error: -w/--width requires an argument.")
+                sys.exit(1)
+        elif arg in ('-H', '-h', '--height'):
+            if i + 1 < len(args):
+                target_h = int(args[i+1])
+                i += 2
+            else:
+                print("[game-res] Error: -h/--height requires an argument.")
+                sys.exit(1)
+        elif arg in ('-s', '-S', '--scale'):
+            if i + 1 < len(args):
+                target_scale = parse_scale(args[i+1])
+                i += 2
+            else:
+                print("[game-res] Error: -s/--scale requires an argument.")
+                sys.exit(1)
+        elif arg == '--':
+            command = args[i+1:]
+            break
+        else:
+            command = args[i:]
+            break
+            
+    return {
+        'preset': target_preset,
+        'width': target_w,
+        'height': target_h,
+        'scale': target_scale,
+        'monitor': target_monitor,
+        'update_conf': update_conf,
+        'restore': is_restore,
+        'command': command
+    }
+
+def main():
+    opts = parse_args()
+    backend, iface = get_display_interface()
+    serial, monitors, current_logical = get_current_config(backend, iface)
+    
+    # 1. Handle baseline conf file loading/saving
+    conf_data = load_conf()
+    
+    if conf_data is None:
+        conf_data = {
+            'last_target_monitor': 'primary',
+            'logical_monitors': [dict(lm) for lm in current_logical]
+        }
+        save_conf(conf_data)
+        print(f"[game-res] Initialized baseline configuration in {CONF_FILE}")
+    elif opts['update_conf']:
+        if conf_data.get('logical_monitors') != current_logical:
+            conf_data['logical_monitors'] = [dict(lm) for lm in current_logical]
+            save_conf(conf_data)
+            print(f"[game-res] Updated baseline configuration in {CONF_FILE}")
+        else:
+            print(f"[game-res] Baseline configuration in {CONF_FILE} is already up to date.")
+            
+    # 2. Check if we have no action requested (no resolution change, no scale change, no restore)
+    has_res_action = (opts['preset'] is not None or opts['width'] is not None or opts['height'] is not None)
+    has_scale_action = (opts['scale'] is not None)
+    if not has_res_action and not has_scale_action and not opts['restore']:
+        print_status_report(conf_data, monitors, current_logical)
+        return 0
+
+    # 3. Handle --restore
+    if opts['restore']:
+        restore_spec = opts['monitor'] if opts['monitor'] else conf_data.get('last_target_monitor', 'primary')
+        print(f"[game-res] Restoring target: '{restore_spec}' from baseline {CONF_FILE}...")
+        
+        target_connectors = resolve_target_connectors(restore_spec, current_logical)
+        baseline_lms = {lm['connector']: lm for lm in conf_data.get('logical_monitors', [])}
+        
+        cur_serial, _, live_logical = get_current_config(backend, iface)
+        new_logical = []
+        for lm in live_logical:
+            conn = lm['connector']
+            if conn in target_connectors and conn in baseline_lms:
+                new_logical.append(dict(baseline_lms[conn]))
+            else:
+                new_logical.append(dict(lm))
+                
+        try:
+            apply_config(backend, iface, cur_serial, new_logical)
+            print("[game-res] Desktop configuration restored successfully.")
+            return 0
+        except Exception as e:
+            print(f"[game-res] Error restoring configuration: {e}")
+            return 1
+
+    # 4. Target Resolution Switch
+    target_spec = opts['monitor'] if opts['monitor'] else 'primary'
+    target_connectors = resolve_target_connectors(target_spec, current_logical)
+    
+    # Prepare restore callback for clean exit
+    restored = [False]
+    def restore():
+        if restored[0]:
+            return
+        restored[0] = True
+        print(f"\n[game-res] Restoring display configuration from baseline...")
+        try:
+            cur_serial, _, live_logical = get_current_config(backend, iface)
+            baseline_lms = {lm['connector']: lm for lm in conf_data.get('logical_monitors', [])}
+            restore_lms = []
+            for lm in live_logical:
+                conn = lm['connector']
+                if conn in target_connectors and conn in baseline_lms:
+                    restore_lms.append(dict(baseline_lms[conn]))
+                else:
+                    restore_lms.append(dict(lm))
+            apply_config(backend, iface, cur_serial, restore_lms)
+            print("[game-res] Baseline configuration restored.")
+        except Exception as e:
+            print(f"[game-res] Failed to restore display config: {e}")
+
+    atexit.register(restore)
+
+    child_p = [None]
+    def handle_signal(sig, frame):
+        print(f"\n[game-res] Caught signal {sig}, exiting and restoring display...")
+        if child_p[0] and child_p[0].poll() is None:
+            try:
+                child_p[0].terminate()
+            except Exception:
+                pass
+        restore()
+        sys.exit(128 + sig)
+
+    for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(s, handle_signal)
+
+    # Build new logical monitors configuration
+    new_logical = []
+    for lm in current_logical:
+        conn = lm['connector']
+        if conn not in target_connectors:
+            new_logical.append(dict(lm))
+            continue
+            
+        phys = next((m for m in monitors if m['connector'] == conn), None)
+        if not phys or not phys['modes']:
+            print(f"[game-res] Error: No physical modes found for connector {conn}.")
+            return 1
+            
+        native_mode = phys['modes'][0]
+        aspect_name, native_ratio = detect_aspect_ratio(native_mode['w'], native_mode['h'])
+        
+        if not has_res_action and has_scale_action:
+            # Scale-only adjustment: preserve current mode
+            mode_id = lm['mode_id']
+            target_scale = opts['scale']
+            curr_m = next((m for m in phys['modes'] if m['id'] == mode_id), None)
+            if curr_m:
+                best_w, best_h, best_rate = curr_m['w'], curr_m['h'], curr_m['rate']
+            else:
+                best_w, best_h, best_rate = native_mode['w'], native_mode['h'], native_mode['rate']
+            print(f"[game-res] Target scale for {conn}: {best_w}x{best_h}@{best_rate:.0f}Hz ({mode_id}) scale {target_scale*100:.0f}% ({target_scale})")
+        else:
+            # Resolution + optional scale adjustment
+            calc_w = opts['width']
+            calc_h = opts['height']
+            
+            if opts['preset']:
+                preset_key = opts['preset']
+                if preset_key in TIER_HEIGHTS:
+                    tier_h = TIER_HEIGHTS[preset_key]
+                    if aspect_name in ASPECT_RATIO_TIERS and tier_h in ASPECT_RATIO_TIERS[aspect_name]:
+                        calc_w, calc_h = ASPECT_RATIO_TIERS[aspect_name][tier_h]
+                    else:
+                        calc_h = tier_h
+                        calc_w = int(round(tier_h * native_ratio))
+                else:
+                    print(f"[game-res] Unknown preset '{preset_key}'. Supported: FHD, 1080P, 2K, QHD, 1440P, 4K, UHD")
+                    return 1
+            elif calc_w is None and calc_h is None:
+                calc_w = 2560
+                calc_h = 1440
+            elif calc_w is not None and calc_h is None:
+                calc_h = int(round(calc_w / native_ratio))
+            elif calc_h is not None and calc_w is None:
+                calc_w = int(round(calc_h * native_ratio))
+                
+            target_scale = opts['scale'] if opts['scale'] is not None else 1.0
+            mode_id, best_w, best_h, best_rate = pick_best_mode(phys['modes'], calc_w, calc_h, native_ratio)
+            print(f"[game-res] Target for {conn}: {best_w}x{best_h}@{best_rate:.0f}Hz ({mode_id}) scale {target_scale*100:.0f}% ({target_scale}) [Native Aspect: {aspect_name}]")
+        
+        new_lm = dict(lm)
+        new_lm['scale'] = float(target_scale)
+        new_lm['mode_id'] = mode_id
+        new_logical.append(new_lm)
+        
+    try:
+        apply_config(backend, iface, serial, new_logical)
+        print("[game-res] Display configuration switched successfully.")
+        # Persist last targeted monitor in conf
+        conf_data['last_target_monitor'] = target_spec
+        save_conf(conf_data)
+    except Exception as e:
+        print(f"[game-res] Failed to apply target display settings: {e}")
+        return 1
+        
+    exit_code = 0
+    cmd = opts['command']
+    if cmd:
+        print(f"[game-res] Launching: {' '.join(cmd)}")
+        try:
+            p = subprocess.Popen(cmd)
+            child_p[0] = p
+            p.wait()
+            exit_code = p.returncode
+        except Exception as e:
+            print(f"[game-res] Error running command: {e}")
+            exit_code = 1
+        finally:
+            restore()
+    else:
+        # If run without command, prompt or keep until user presses Enter or Ctrl+C
+        print("\n[game-res] Resolution applied without a child command.")
+        print("[game-res] Press Enter or Ctrl+C to revert back to original configuration...")
+        try:
+            input()
+        except (KeyboardInterrupt, EOFError):
+            pass
+        restore()
+
+    return exit_code
+
+if __name__ == '__main__':
+    sys.exit(main())

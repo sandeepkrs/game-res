@@ -1,0 +1,25 @@
+# Local hardware display configuration (auto-generated on first run)
+game-res.conf
+*.conf
+
+# Python cache & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Editor / IDE directories
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS artifacts
+.DS_Store
+Thumbs.db
